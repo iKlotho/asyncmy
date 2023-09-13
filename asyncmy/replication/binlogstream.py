@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Set, Type, Union
 from asyncmy import Connection
 from asyncmy.constants.COMMAND import COM_BINLOG_DUMP, COM_BINLOG_DUMP_GTID, COM_REGISTER_SLAVE
 from asyncmy.cursors import DictCursor
+from asyncmy.errors import OperationalError
 from asyncmy.replication.constants import (
     BINLOG_DUMP_NON_BLOCK,
     BINLOG_THROUGH_GTID,
@@ -11,7 +12,7 @@ from asyncmy.replication.constants import (
     ROTATE_EVENT,
     TABLE_MAP_EVENT,
 )
-from asyncmy.replication.errors import BinLogNotEnabledError, StreamClosedError
+from asyncmy.replication.errors import BinLogNotEnabledError
 from asyncmy.replication.events import (
     BeginLoadQueryEvent,
     BinLogEvent,
@@ -93,6 +94,8 @@ class ReportSlave:
 
 
 class BinLogStream:
+    MYSQL_EXPECTED_ERROR_CODES = [2013, 2006]
+
     def __init__(
         self,
         connection: Connection,
@@ -275,11 +278,18 @@ class BinLogStream:
     async def _read(self):
         if not self._connected:
             await self._connect()
+        try:
+            pkt = await self._connection.read_packet()
+        except OperationalError as e:
+            code, _ = e.args
+            if code in self.MYSQL_EXPECTED_ERROR_CODES:
+                await self.close()
+                return
+            raise e
 
-        pkt = await self._connection.read_packet()
         if pkt.is_eof_packet():
             await self.close()
-            raise StreamClosedError("BinLogStream is closed")
+            return
 
         if not pkt.is_ok_packet():
             return
@@ -358,11 +368,8 @@ class BinLogStream:
     async def __anext__(self):
         if not self._connected:
             await self._connect()
-        try:
+        ret = await self._read()
+        while ret is None:
             ret = await self._read()
-            while ret is None:
-                ret = await self._read()
-                continue
-            return ret
-        except StreamClosedError:
-            raise StopAsyncIteration
+            continue
+        return ret
